@@ -6,7 +6,7 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        entryFileNames: 'widget.js'  // produce a simple bundle name
+        entryFileNames: 'widget.js'
       }
     }
   }
