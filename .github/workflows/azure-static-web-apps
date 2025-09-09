@@ -13,16 +13,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 🔎 Show what CI actually sees
       - name: Debug project layout
         run: |
-          echo "=== ls -la (root) ==="
-          ls -la
-          echo "=== ls -la src ==="
-          ls -la src || true
-          echo "=== show index.html ==="
-          sed -n '1,120p' index.html || true
-          echo "=== grep absolute import ==="
-          (grep -n "/src/main.tsx" index.html && echo "FOUND /src/main.tsx in index.html") || echo "No absolute import found"
+          echo "=== ls -la (root) ==="; ls -la
+          echo "=== find index.html files ==="; find . -name "index.html" -maxdepth 2 -print
+          echo "=== show root index.html ==="; sed -n '1,160p' index.html || true
+          echo "=== grep '/src/main.tsx' in repo ==="; grep -R --line-number "/src/main.tsx" || true
+          echo "=== ensure src files exist ==="; ls -la src || true
+
+      # 🛠️ FORCE replace absolute -> relative if it's still there
+      - name: Patch index.html import path
+        run: |
+          if grep -q '/src/main.tsx' index.html; then
+            sed -i 's|/src/main.tsx|./src/main.tsx|g' index.html
+            echo "Patched index.html to use ./src/main.tsx"
+          else
+            echo "No absolute import found; nothing to patch."
+          fi
+          echo "=== show patched index.html ==="; sed -n '1,160p' index.html
+
+      # (Optional) Handle any leftover absolute "/src" imports
+      - name: Ensure Vite config resolves '/src'
+        run: |
+          if [ -f vite.config.ts ]; then
+            grep -q "alias" vite.config.ts || cat >> vite.config.ts <<'EOF'
+
+import { fileURLToPath, URL } from 'node:url'
+export default {
+  base: './',
+  resolve: { alias: { '/src': fileURLToPath(new URL('./src', import.meta.url)) } }
+}
+EOF
+          fi
 
       - name: Build And Deploy
         uses: Azure/static-web-apps-deploy@v1
