@@ -21,7 +21,7 @@ export default function App() {
       const data = await res.json();
       const reply = data?.reply ?? '(no response)';
       setMessages(m => [...m, { role: 'assistant', content: reply }]);
-    } catch (e) {
+    } catch {
       setMessages(m => [...m, { role: 'assistant', content: 'Sorry, something went wrong.' }]);
     } finally {
       setBusy(false);
