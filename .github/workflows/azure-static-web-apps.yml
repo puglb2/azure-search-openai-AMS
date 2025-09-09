@@ -1,114 +1,42 @@
-name: Azure Static Web Apps CI/CD
+name: SWA Deploy (clean)
 
 on:
   push:
     branches: [ main ]
   pull_request:
-    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
+  workflow_dispatch:
+
+# Avoid overlapping deploys
+concurrency:
+  group: swa-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build_and_deploy_job:
+  build_and_deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      # 0) Show what the runner sees (helps if anything else breaks)
-      - name: Debug project layout (before patch)
+      # (Optional) quick visibility into what’s being built
+      - name: Show project layout
         run: |
-          echo "=== ls -la (root) ==="; ls -la
-          echo "=== ls -la src (if exists) ==="; ls -la src || true
-          echo "=== find index.html files ==="; find . -maxdepth 3 -name "index.html" -print
-          echo "=== HEAD of root index.html (if exists) ==="; sed -n '1,120p' index.html || true
-          echo "=== grep '/src/main.tsx' anywhere ==="; grep -R --line-number "/src/main.tsx" || true
+          echo "=== root ==="; ls -la
+          echo "=== src ==="; ls -la src || true
+          echo "=== index.html head ==="; sed -n '1,120p' index.html || true
 
-      # 1) HARD REPLACE index.html with a clean one that uses a RELATIVE import
-      - name: Overwrite root index.html to force correct import
-        run: |
-          cat > index.html <<'EOF'
-          <!doctype html>
-          <html lang="en">
-            <body>
-              <div id="ams-intake-chat"></div>
-              <script type="module">
-                import './src/main.tsx';
-              </script>
-            </body>
-          </html>
-          EOF
-          echo "=== HEAD of new index.html ==="; sed -n '1,120p' index.html
-
-      # 2) Ensure src/main.tsx & src/App.tsx exist (create minimal fallbacks if missing)
-      - name: Ensure src files exist
-        run: |
-          mkdir -p src
-          [ -f src/main.tsx ] || cat > src/main.tsx <<'EOF'
-          import React from 'react';
-          import { createRoot } from 'react-dom/client';
-          import App from './App';
-          const el = document.getElementById('ams-intake-chat');
-          if (el) { createRoot(el).render(<App />); }
-          EOF
-          [ -f src/App.tsx ] || cat > src/App.tsx <<'EOF'
-          import React from 'react';
-          export default function App() {
-            return (<div style={{padding:16,fontFamily:'system-ui'}}><h3>AMS Intake Assistant</h3><p>It works 🎉</p></div>);
-          }
-          EOF
-          echo "=== ls -la src after ensure ==="; ls -la src
-
-      # 3) Ensure vite config and build script exist
-      - name: Ensure vite config and package.json have build
-        run: |
-          if [ ! -f vite.config.ts ]; then
-            cat > vite.config.ts <<'EOF'
-            import { defineConfig } from 'vite'
-            import react from '@vitejs/plugin-react'
-            import { fileURLToPath, URL } from 'node:url'
-            export default defineConfig({
-              base: './',
-              plugins: [react()],
-              resolve: { alias: { '/src': fileURLToPath(new URL('./src', import.meta.url)) } },
-              build: { rollupOptions: { output: { entryFileNames: 'widget.js' } } }
-            })
-            EOF
-          fi
-          # add build script if missing
-          if ! grep -q '"build"' package.json; then
-            # minimal package.json if none (or add script)
-            if [ ! -f package.json ]; then
-              cat > package.json <<'EOF'
-              {
-                "name": "ams-intake-widget",
-                "private": true,
-                "version": "0.1.0",
-                "type": "module",
-                "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
-                "dependencies": { "react": "^18.3.1", "react-dom": "^18.3.1" },
-                "devDependencies": { "@vitejs/plugin-react": "^4.3.3", "typescript": "^5.6.3", "vite": "^5.4.10" }
-              }
-              EOF
-            else
-              # inject "build": "vite build" if scripts section exists but no build
-              node -e "
-                const fs=require('fs');
-                const p=JSON.parse(fs.readFileSync('package.json','utf8'));
-                p.scripts=p.scripts||{};
-                p.scripts.build=p.scripts.build||'vite build';
-                fs.writeFileSync('package.json', JSON.stringify(p,null,2));
-              "
-            fi
-          fi
-          echo "=== package.json ==="; cat package.json
-
-      # 4) Build & deploy
-      - name: Build And Deploy
+      - name: Build & Deploy to Azure Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
+          # Required: set this secret in GitHub → Settings → Secrets → Actions
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: upload
-          app_location: "/"
-          api_location: "api"
-          output_location: "dist"
+          # Paths for your project (adjust only if your structure is different)
+          app_location: "/"          # repo root (where index.html, package.json live)
+          api_location: "api"        # Azure Functions folder (omit if you have none)
+          output_location: "dist"    # Vite build output
+          # Explicit build command so Oryx runs Vite
           app_build_command: "npm ci && npm run build"
