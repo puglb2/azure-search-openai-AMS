@@ -1,23 +1,24 @@
-import fetch from "node-fetch";
-import { cfg } from "../shared/config.js";
-
-export default async function (context, req) {
-  const userMessage = (req.body && req.body.message) || "";
-  if (!userMessage) {
-    context.res = { status: 400, body: { error: "message required" } };
-    return;
-  }
-
+module.exports = async function (context, req) {
   try {
-    // Minimal echo with Azure OpenAI placeholder; replace with tool-calling logic
-    if (!cfg.openaiEndpoint || !cfg.openaiKey || !cfg.openaiDeployment) {
-      context.res = { status: 200, body: { reply: "Hello! (Model not configured yet.)" } };
+    const userMessage = (req.body && req.body.message) || "";
+    if (!userMessage) {
+      context.res = { status: 400, headers: { "Content-Type": "application/json" }, body: { error: "message required" } };
       return;
     }
 
-    const resp = await fetch(`${cfg.openaiEndpoint}/openai/deployments/${cfg.openaiDeployment}/chat/completions?api-version=2024-08-01-preview`, {
+    const endpoint   = process.env.AZURE_OPENAI_ENDPOINT;
+    const apiKey     = process.env.AZURE_OPENAI_API_KEY;
+    const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+
+    if (!endpoint || !apiKey || !deployment) {
+      context.res = { status: 200, headers: { "Content-Type": "application/json" }, body: { reply: "Hello! (Model not configured yet.)" } };
+      return;
+    }
+
+    const url = `${endpoint.replace(/\/+$/, "")}/openai/deployments/${deployment}/chat/completions?api-version=2024-08-01-preview`;
+    const resp = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "api-key": cfg.openaiKey },
+      headers: { "Content-Type": "application/json", "api-key": apiKey },
       body: JSON.stringify({
         messages: [
           { role: "system", content: "You are a warm, trauma-informed intake assistant. Keep answers concise. No diagnosis. If crisis language appears, advise 988 and stop." },
@@ -28,18 +29,23 @@ export default async function (context, req) {
       })
     });
 
+    const ct = resp.headers.get("content-type") || "";
+    const body = ct.includes("application/json") ? await resp.json() : { text: await resp.text() };
+
     if (!resp.ok) {
-      const txt = await resp.text();
-      context.log("OpenAI error:", resp.status, txt);
-      context.res = { status: 502, body: { error: "LLM error" } };
+      context.log("OpenAI error:", resp.status, body);
+      context.res = {
+        status: 502,
+        headers: { "Content-Type": "application/json" },
+        body: { error: "LLM error", status: resp.status, detail: body }
+      };
       return;
     }
 
-    const data = await resp.json();
-    const reply = data?.choices?.[0]?.message?.content ?? "(no content)";
-    context.res = { status: 200, body: { reply } };
+    const reply = body?.choices?.[0]?.message?.content ?? "(no content)";
+    context.res = { status: 200, headers: { "Content-Type": "application/json" }, body: { reply } };
   } catch (e) {
-    context.log("chat error", e);
-    context.res = { status: 500, body: { error: "server error" } };
+    context.log("chat error", String(e));
+    context.res = { status: 500, headers: { "Content-Type": "application/json" }, body: { error: "server error" } };
   }
-}
+};
