@@ -15,18 +15,9 @@ concurrency:
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show repo layout (debug)
-        run: |
-          echo "=== ls -la (root) ==="; ls -la
-          echo "=== ls -la src (if exists) ==="; ls -la src || true
-          echo "=== ls -la api (if exists) ==="; ls -la api || true
-          echo "=== print root index.html head (if exists) ==="; sed -n '1,80p' index.html || true
-          echo "=== print vite.config.ts (if exists) ==="; sed -n '1,120p' vite.config.ts || true
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -37,25 +28,33 @@ jobs:
       - name: Install deps
         run: |
           if [ -f package-lock.json ]; then
-            echo "Using npm ci"; npm ci
+            npm ci
           else
-            echo "No lockfile, using npm install"; npm install
+            npm install
           fi
 
       - name: Build (Vite -> dist/)
         run: npm run build
 
-      - name: Verify build (debug)
+      - name: Verify dist (fail if wrong)
         run: |
-          echo "=== dist ==="; ls -la dist || true
-          echo "=== dist/index.html head ==="; sed -n '1,80p' dist/index.html || true
+          echo "=== dist ==="; ls -la dist
+          echo "=== dist/assets ==="; ls -la dist/assets
+          echo "=== HEAD of dist/index.html ==="; sed -n '1,120p' dist/index.html
+          if grep -q "src/main.tsx" dist/index.html; then
+            echo "ERROR: dist/index.html still references src/main.tsx (build not applied)"; exit 1;
+          fi
+          if grep -q 'src="/assets/' dist/index.html; then
+            echo "ERROR: dist/index.html uses absolute /assets paths. Set base: \"./\" in vite.config.ts"; exit 1;
+          fi
 
-      - name: Deploy to Azure Static Web Apps
+      # IMPORTANT: point app_location to dist and upload THAT folder as-is
+      - name: Deploy to Azure Static Web Apps (upload dist as app)
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
           action: upload
-          app_location: "/"            
-          app_artifact_location: "dist"  
-          api_location: "api"          
-          skip_app_build: true
+          app_location: "dist"          # << serve the built app directly
+          app_artifact_location: ""     # << nothing else to look for
+          skip_app_build: true          # we already built
+          api_location: "api"
