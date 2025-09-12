@@ -1,10 +1,43 @@
+// api/chat/index.js
+const fs = require("fs");
+const path = require("path");
+
+// ---------- load & cache instruction files ----------
+let SYS_PROMPT = "";
+let FAQ_SNIPPET = "";
+let POLICIES_SNIPPET = "";
+
+function readIfExists(p) { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } }
+
+function initConfig() {
+  if (SYS_PROMPT) return; // already loaded
+  const cfgDir = path.join(__dirname, "../_config");
+  SYS_PROMPT      = readIfExists(path.join(cfgDir, "system_prompt.txt")).trim();
+  FAQ_SNIPPET     = readIfExists(path.join(cfgDir, "faqs.txt")).trim();
+  POLICIES_SNIPPET= readIfExists(path.join(cfgDir, "policies.txt")).trim();
+
+  if (FAQ_SNIPPET) {
+    SYS_PROMPT += `
+
+# FAQ (for quick reference; summarize when answering)
+${FAQ_SNIPPET}`.trim();
+  }
+  if (POLICIES_SNIPPET) {
+    SYS_PROMPT += `
+
+# Policy notes (adhere to these)
+${POLICIES_SNIPPET}`.trim();
+  }
+}
+
+// ---------- AOAI call helper ----------
 async function callAOAI(url, messages, temperature, maxTokens, apiKey) {
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "api-key": apiKey },
     body: JSON.stringify({
       messages,
-      temperature,                 // keep = 1 for your model
+      temperature,                 // your model needs 1
       max_completion_tokens: maxTokens
     })
   });
@@ -15,7 +48,7 @@ async function callAOAI(url, messages, temperature, maxTokens, apiKey) {
 
 module.exports = async function (context, req) {
   try {
-    // ... (your existing initConfig + env var reads)
+    initConfig();
 
     const userMessage = (req.body?.message || "").toString().trim();
     if (!userMessage) {
@@ -23,29 +56,36 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // keep history short to avoid bloat (last 8 messages if you’re passing history)
-    // If you’re not keeping history server-side, ignore this.
+    // ---- SAFE reads of env vars (no undefined.trim()!) ----
+    const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview") + "").trim();
+    const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,"");   // e.g. https://<resource>.openai.azure.com
+    const deployment = ((process.env.AZURE_OPENAI_DEPLOYMENT || "") + "").trim();
+    const apiKey     = ((process.env.AZURE_OPENAI_API_KEY || "") + "").trim();
+
+    if (!endpoint || !deployment || !apiKey) {
+      context.res = { status: 200, headers: { "Content-Type":"application/json" }, body: { reply: "Hello! (Model not configured yet.)" } };
+      return;
+    }
+
+    const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
+
     const baseMessages = [
       { role: "system", content: SYS_PROMPT || "You are a helpful intake assistant." },
       { role: "user",   content: userMessage }
     ];
 
-    const apiVersion = (process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview").trim();
-    const endpoint   = process.env.AZURE_OPENAI_ENDPOINT.trim().replace(/\/+$/,"");
-    const deployment = process.env.AZURE_OPENAI_DEPLOYMENT.trim();
-    const apiKey     = process.env.AZURE_OPENAI_API_KEY.trim();
-    const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
-
-    // 1st attempt
-    let { resp, data } = await callAOAI(url, baseMessages, 1, 384, apiKey); // bump tokens a bit
+    // First attempt
+    let { resp, data } = await callAOAI(url, baseMessages, 1, 384, apiKey);
     let choice = data?.choices?.[0];
     let reply  = choice?.message?.content?.trim() || "";
+
     const filtered = choice?.finish_reason === "content_filter" ||
       (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
-        const cfr = r?.content_filter_results; return cfr && Object.values(cfr).some(v => v?.filtered);
+        const cfr = r?.content_filter_results;
+        return cfr && Object.values(cfr).some(v => v?.filtered);
       }));
 
-    // If empty or filtered, retry once with a tiny nudge
+    // Retry once with a tiny nudge if empty/filtered
     if ((!reply || filtered) && resp.ok) {
       const nudged = [
         baseMessages[0],
@@ -53,9 +93,10 @@ module.exports = async function (context, req) {
         baseMessages[1]
       ];
       const second = await callAOAI(url, nudged, 1, 256, apiKey);
-      resp = second.resp; data = second.data;
+      resp   = second.resp;
+      data   = second.data;
       choice = data?.choices?.[0];
-      reply  = choice?.message?.content?.trim() || reply; // use new reply if we got one
+      reply  = choice?.message?.content?.trim() || reply;
     }
 
     if (!resp.ok) {
@@ -63,18 +104,24 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Optional diagnostics: add ?debug=1 to the /api/chat URL to inspect
+    // Optional debug: /api/chat?debug=1
     if ((req.query?.debug === "1") && data) {
       context.res = {
         status: 200,
         headers: { "Content-Type":"application/json" },
-        body: { reply: reply || "", finish_reason: choice?.finish_reason, prompt_filter_results: data?.prompt_filter_results, usage: data?.usage }
+        body: {
+          reply: reply || "",
+          finish_reason: choice?.finish_reason,
+          prompt_filter_results: data?.prompt_filter_results,
+          usage: data?.usage
+        }
       };
       return;
     }
 
     context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply: reply || "" } };
   } catch (e) {
+    // Return the error text so you can see what failed (temporarily; remove later if you prefer)
     context.res = { status: 500, headers: {"Content-Type":"application/json"}, body: { error: "server error", detail: String(e) } };
   }
 };
