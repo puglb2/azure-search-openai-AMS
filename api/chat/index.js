@@ -25,7 +25,7 @@ module.exports = async function (context, req) {
           { role: "system", content: "You are a helpful intake assistant." },
           { role: "user",   content: userMessage }
         ],
-        temperature: 0.3,
+        temperature: 1,
         max_completion_tokens: 256
       })
     });
