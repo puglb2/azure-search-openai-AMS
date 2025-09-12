@@ -21,13 +21,12 @@ module.exports = async function (context, req) {
       method: "POST",
       headers: { "Content-Type": "application/json", "api-key": apiKey },
       body: JSON.stringify({
-        // keep it minimal & widely compatible
         messages: [
           { role: "system", content: "You are a helpful intake assistant." },
           { role: "user",   content: userMessage }
         ],
         temperature: 0.3,
-        max_tokens: 256
+        max_completion_tokens: 256
       })
     });
 
