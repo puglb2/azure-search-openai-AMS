@@ -30,16 +30,16 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', maxWidth: 560, margin: '0 auto', padding: 16 }}>
-      <h3>AMS Intake Assistant</h3>
+      <h3>Beep Beep Boop</h3>
       <div style={{ border: '1px solid #ddd', borderRadius: 8, padding: 12, height: 360, overflowY: 'auto', background: '#fff' }}>
         {messages.length === 0 ? (
           <div style={{ color: '#666' }}>
-            Welcome! Type anything to check connectivity with /api/chat.
+            Welcome! Start typing and let me help connect you to a provider.
           </div>
         ) : (
           messages.map((m, i) => (
             <div key={i} style={{ margin: '8px 0' }}>
-              <strong>{m.role === 'user' ? 'You' : 'Assistant'}:</strong> {m.content}
+              <strong>{m.role === 'user' ? 'You' : 'Bucket O Bolts'}:</strong> {m.content}
             </div>
           ))
         )}
