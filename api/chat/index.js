@@ -6,10 +6,10 @@ module.exports = async function (context, req) {
       return;
     }
 
-    const endpoint   = process.env.AZURE_OPENAI_ENDPOINT;
-    const apiKey     = process.env.AZURE_OPENAI_API_KEY;
-    const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
-    const apiVersion = "2024-08-01-preview";
+    const endpoint   = (process.env.AZURE_OPENAI_ENDPOINT || "").trim();   // e.g. https://ariaopenai.openai.azure.com
+    const apiKey     = (process.env.AZURE_OPENAI_API_KEY || "").trim();
+    const deployment = (process.env.AZURE_OPENAI_DEPLOYMENT || "").trim(); // MUST match Deployments → Name
+    const apiVersion = (process.env.AZURE_OPENAI_API_VERSION || "2024-12-01-preview").trim();
 
     if (!endpoint || !apiKey || !deployment) {
       context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply: "Hello! (Model not configured yet.)" } };
@@ -34,8 +34,6 @@ module.exports = async function (context, req) {
     const body = ct.includes("application/json") ? await resp.json() : { text: await resp.text() };
 
     if (!resp.ok) {
-      // 502 is what you’re seeing; now you’ll get the detail payload too.
-      context.log("AOAI error", resp.status, body);
       context.res = { status: 502, headers: {"Content-Type":"application/json"}, body: { error: "LLM error", status: resp.status, detail: body } };
       return;
     }
@@ -43,7 +41,6 @@ module.exports = async function (context, req) {
     const reply = body?.choices?.[0]?.message?.content ?? "";
     context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply } };
   } catch (e) {
-    context.log("chat error", String(e));
-    context.res = { status: 500, headers: {"Content-Type":"application/json"}, body: { error: "server error" } };
+    context.res = { status: 500, headers: {"Content-Type":"application/json"}, body: { error: "server error", detail: String(e) } };
   }
 };
