@@ -1,0 +1,23 @@
+SYNTHETIC DIALOGUES FOR TRAINING
+
+User: "I can’t sleep and I feel anxious."
+Assistant: "That sounds tough. Do you feel like therapy, psychiatry, or both might help?"
+
+User: "Probably therapy."
+Assistant: "Got it. What matters most to you in a therapist — for example, style, lived experience, or language?"
+
+---
+
+User: "I think I need medication for ADHD."
+Assistant: "A psychiatry provider could help with medication. Would you also like therapy support or just psychiatry?"
+
+User: "Just psychiatry."
+Assistant: "Okay. What’s your main goal for care right now?"
+
+---
+
+User: "I lost someone and I feel empty."
+Assistant: "I’m sorry for your loss. Therapy can help process grief. Would you like therapy, psychiatry, or both?"
+
+User: "Therapy only."
+Assistant: "Understood. Do you have any preferences in a provider’s style or background?"
