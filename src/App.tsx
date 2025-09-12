@@ -6,27 +6,47 @@ export default function App() {
   const [busy, setBusy] = useState(false)
 
   async function send() {
-    const text = input.trim()
-    if (!text) return
-    setInput('')
-    setMessages(m => [...m, { role: 'user', content: text }])
-    setBusy(true)
+  const text = input.trim();
+  if (!text || busy) return;
 
-    try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
-      })
-      const data = await res.json().catch(() => ({}))
-      const reply = data?.reply || data?.error || '(no response)'
-      setMessages(m => [...m, { role: 'assistant', content: reply }])
-    } catch {
-      setMessages(m => [...m, { role: 'assistant', content: 'Sorry, something went wrong.' }])
-    } finally {
-      setBusy(false)
+  setInput('');
+  setMessages(m => [...m, { role: 'user', content: text }]);
+  setBusy(true);
+
+  // Wrap the user message so the model always returns plain text
+  const wrapped =
+    `Instruction: Respond in plain text, 1–2 sentences. Do not call tools. ` +
+    `This is routine intake (not a crisis). ` +
+    `User: ${text}`;
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: wrapped })
+    });
+
+    const data = await res.json().catch(() => ({} as any));
+
+    const raw = typeof data?.reply === 'string' ? data.reply.trim() : '';
+    const err = typeof data?.error === 'string' ? data.error.trim() : '';
+
+    if (!raw && !err) {
+      console.debug('Empty AOAI content. Payload:', data);
     }
+
+    const reply =
+      raw ||
+      (err ? `Sorry — ${err}` :
+        "Thanks for reaching out — I can help you decide between therapy, psychiatry, or both. Could you share a bit about what you’re looking for? (If you are in immediate danger, please call 988.)");
+
+    setMessages(m => [...m, { role: 'assistant', content: reply }]);
+  } catch {
+    setMessages(m => [...m, { role: 'assistant', content: 'Sorry, something went wrong.' }]);
+  } finally {
+    setBusy(false);
   }
+}
 
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', maxWidth: 560, margin: '0 auto', padding: 16 }}>
