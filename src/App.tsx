@@ -9,7 +9,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
-  // Auto-scroll to latest message
+  // Auto-scroll to bottom on new messages
   useEffect(() => {
     const el = scrollerRef.current
     if (el) el.scrollTop = el.scrollHeight
@@ -19,24 +19,27 @@ export default function App() {
     const text = input.trim()
     if (!text || busy) return
 
-    // Optimistically show the user message
+    // Show user message immediately
     setInput('')
     setMessages(m => [...m, { role: 'user', content: text }])
     setBusy(true)
 
     try {
-      // Include a short transcript so the API can keep context
+      // Keep a short transcript so the API can remember context
       const history = messages
         .slice(-8)
-        .map(m => ({ role: m.role, content: (m.content || '').toString().trim() }))
+        .map(m => ({
+          role: m.role,
+          content: (m.content || '').toString().trim()
+        }))
         .filter(m => m.content)
 
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: text,     // latest turn
-          history            // recent context (optional; server will handle if empty)
+          message: text,
+          history
         })
       })
 
