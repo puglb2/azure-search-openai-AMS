@@ -6,26 +6,33 @@ export default function App() {
   const [busy, setBusy] = useState(false)
 
   async function send() {
-  const text = input.trim();
-  if (!text || busy) return;
-
-  setInput('');
-  setMessages(m => [...m, { role: 'user', content: text }]);
-  setBusy(true);
-
-  // Wrap the user message so the model always returns plain text
-  const wrapped =
-    `Instruction: Respond in plain text, 1–2 sentences. Do not call tools. ` +
-    `This is routine intake (not a crisis). ` +
-    `User: ${text}`;
+  const text = input.trim()
+  if (!text || busy) return
+  setInput('')
+  setMessages(m => [...m, { role: 'user', content: text }])
+  setBusy(true)
 
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: wrapped })
-    });
-
+      body: JSON.stringify({
+        message: text,
+        history: messages.slice(-8).map(m => ({
+          role: m.role,
+          content: m.content
+        }))
+      })
+    })
+    const data = await res.json().catch(() => ({} as any))
+    const reply = typeof data?.reply === 'string' ? data.reply.trim() : '(no response)'
+    setMessages(m => [...m, { role: 'assistant', content: reply }])
+  } catch {
+    setMessages(m => [...m, { role: 'assistant', content: 'Sorry, something went wrong.' }])
+  } finally {
+    setBusy(false)
+  }
+}
     const data = await res.json().catch(() => ({} as any));
 
     const raw = typeof data?.reply === 'string' ? data.reply.trim() : '';
