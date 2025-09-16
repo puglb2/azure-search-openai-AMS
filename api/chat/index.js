@@ -87,7 +87,7 @@ function buildOydBlock(env, safeMode) {
       endpoint,
       index_name: index,
       authentication: { type: "api_key", key },
-      top_n_documents: 6,
+      top_n_documents: 9,
       strictness: 3,
       query_type: queryType
     }
@@ -145,7 +145,7 @@ module.exports = async function (context, req) {
     // Prepare request body
     const requestBody = {
       messages: baseMessages,
-      temperature: 0.2,
+      temperature: 1,
       max_tokens: 600
     };
     if (oydBlock) {
@@ -185,7 +185,7 @@ module.exports = async function (context, req) {
             { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
             baseMessages[1]
           ],
-          temperature: 0.2,
+          temperature: 1,
           max_tokens: 400
         };
         if (oydBlock) nudgedBody.extra_body = { data_sources: [oydBlock] };
