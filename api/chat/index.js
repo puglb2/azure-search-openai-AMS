@@ -58,26 +58,16 @@ async function postJson(url, body, headers = {}, timeoutMs = 30000) {
 
 // ---------- Build embeddings dependency ----------
 function buildEmbeddingDependency(env) {
-  // Preferred: embeddings deployment name in the SAME AOAI resource
   const deploymentName = ((env.AZURE_EMBEDDINGS_DEPLOYMENT || "") + "").trim();
   if (deploymentName) {
     return { type: "deployment_name", deployment_name: deploymentName };
   }
-
-  // Alternate: explicit embeddings endpoint + key
-  // Endpoint format:
-  //   https://<aoai>.openai.azure.com/openai/deployments/<EMBED_DEPLOYMENT>/embeddings
   const endpoint = ((env.AZURE_EMBEDDINGS_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
   const key      = ((env.AZURE_EMBEDDINGS_API_KEY || env.AZURE_OPENAI_API_KEY || "") + "").trim();
   if (endpoint && key) {
-    return {
-      type: "endpoint",
-      endpoint,
-      authentication: { type: "api_key", key }
-    };
+    return { type: "endpoint", endpoint, authentication: { type: "api_key", key } };
   }
-
-  return undefined; // none configured
+  return undefined;
 }
 
 // ---------- Build OYD block if Search is configured ----------
@@ -88,17 +78,14 @@ function buildOydBlock(env, { safeMode }) {
 
   if (!endpoint || !key || !index) return undefined;
 
-  // Query type & semantic config
   let queryType = ((env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim();
   const semantic = ((env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim();
 
-  // Minimal block when safe mode is on
   if (safeMode) {
     return {
       type: "azure_search",
       parameters: {
-        endpoint,
-        index_name: index,
+        endpoint, index_name: index,
         authentication: { type: "api_key", key },
         top_n_documents: 9,
         strictness: 3,
@@ -107,20 +94,15 @@ function buildOydBlock(env, { safeMode }) {
     };
   }
 
-  // If using a vector* query type, we must supply an embeddings dependency
   const isVectorMode = ["vector", "vector_simple_hybrid", "vector_semantic_hybrid"].includes(queryType);
   let embedding_dependency = undefined;
   if (isVectorMode) {
     embedding_dependency = buildEmbeddingDependency(env);
-    if (!embedding_dependency) {
-      // No embeddings configured → degrade to simple to avoid hard failure
-      queryType = "simple";
-    }
+    if (!embedding_dependency) queryType = "simple"; // degrade if missing embeddings
   }
 
   const parameters = {
-    endpoint,
-    index_name: index,
+    endpoint, index_name: index,
     authentication: { type: "api_key", key },
     top_n_documents: 9,
     strictness: 3,
@@ -130,23 +112,45 @@ function buildOydBlock(env, { safeMode }) {
   if (semantic && (queryType === "semantic" || queryType === "vector_semantic_hybrid")) {
     parameters.semantic_configuration = semantic;
   }
-
   if (embedding_dependency) {
     parameters.embedding_dependency = embedding_dependency;
   }
 
-  // Add field mappings ONLY if these fields exist in your index; adjust if needed.
+  // Adjust to your schema if needed
   parameters.fields_mapping = {
     content_fields: ["content", "chunk", "page_content"],
     title_field: "title",
     filepath_field: "source",
     url_field: "url"
   };
-
-  // Optional contexts
   parameters.include_contexts = ["citations", "intent"];
 
   return { type: "azure_search", parameters };
+}
+
+// ---------- Helpers to juggle token param names ----------
+function buildRequestBody(messages, temp, tokens, oydBlock, useMaxCompletionTokens) {
+  const body = { messages, temperature: temp };
+  if (useMaxCompletionTokens) {
+    body.max_completion_tokens = tokens;
+  } else {
+    body.max_tokens = tokens;
+  }
+  if (oydBlock) body.data_sources = [oydBlock];
+  return body;
+}
+function extractErrorMessage(data) {
+  if (!data) return "";
+  if (typeof data === "string") return data;
+  const s = data.error?.message || data.message || data.text || "";
+  return typeof s === "string" ? s : JSON.stringify(s);
+}
+function shouldRetryWithOppositeParam(resp, data, triedMCT) {
+  if (resp.status !== 400) return false;
+  const msg = extractErrorMessage(data).toLowerCase();
+  if (!triedMCT && (msg.includes("unsupported parameter") && msg.includes("max_tokens"))) return true;
+  if (triedMCT && (msg.includes("extra inputs are not permitted") && msg.includes("max_completion_tokens"))) return true;
+  return false;
 }
 
 module.exports = async function (context, req) {
@@ -161,7 +165,7 @@ module.exports = async function (context, req) {
 
     // ---- Env vars (safe reads) ----
     const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-10-21") + "").trim();
-    const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,""); // e.g. https://<resource>.openai.azure.com
+    const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
     const deployment = ((process.env.AZURE_OPENAI_DEPLOYMENT || "") + "").trim();
     const apiKey     = ((process.env.AZURE_OPENAI_API_KEY || "") + "").trim();
 
@@ -181,29 +185,22 @@ module.exports = async function (context, req) {
       { role: "user",   content: userMessage }
     ];
 
-    // Prepare request body
-    const requestBody = {
-      messages: baseMessages,
-      temperature: 1,     // per your request
-      max_tokens: 600
-    };
-    // OYD goes at TOP LEVEL as `data_sources`
-    if (oydBlock) {
-      requestBody.data_sources = [oydBlock];
-    }
+    // Token param strategy: auto-switch based on error
+    const forceMCT = String(process.env.AZURE_USE_MAX_COMPLETION_TOKENS || "auto").toLowerCase();
+    let tryMCTFirst = forceMCT === "1" || forceMCT === "true";
+    let tokens = 600;
+    let temp   = 1;
 
-    // --- Call AOAI (with simple retry for transient 429/503) ---
-    let attempt = 0, result, resp, data;
-    while (attempt < 2) {
-      attempt++;
-      result = await postJson(url, requestBody, { "api-key": apiKey });
-      resp = result.resp; data = result.data;
+    // First attempt
+    let body1 = buildRequestBody(baseMessages, temp, tokens, oydBlock, tryMCTFirst);
+    let { resp, data } = await postJson(url, body1, { "api-key": apiKey });
 
-      if (resp.status === 429 || resp.status === 503) {
-        await new Promise(r => setTimeout(r, 800));
-        continue;
-      }
-      break;
+    // If 400 due to token param name, retry with the opposite param
+    if (!resp.ok && shouldRetryWithOppositeParam(resp, data, tryMCTFirst)) {
+      const body2 = buildRequestBody(baseMessages, temp, tokens, oydBlock, !tryMCTFirst);
+      const second = await postJson(url, body2, { "api-key": apiKey });
+      resp = second.resp; data = second.data;
+      tryMCTFirst = !tryMCTFirst; // remember which one worked for subsequent calls in this execution
     }
 
     if (resp.ok) {
@@ -218,16 +215,13 @@ module.exports = async function (context, req) {
         }));
 
       if ((!reply || filtered) && !req.query?.debug) {
-        const nudgedBody = {
-          messages: [
-            baseMessages[0],
-            { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
-            baseMessages[1]
-          ],
-          temperature: 1,
-          max_tokens: 400
-        };
-        if (oydBlock) nudgedBody.data_sources = [oydBlock];
+        const nudged = [
+          baseMessages[0],
+          { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
+          baseMessages[1]
+        ];
+        const nTokens = 400;
+        const nudgedBody = buildRequestBody(nudged, temp, nTokens, oydBlock, tryMCTFirst);
         const second = await postJson(url, nudgedBody, { "api-key": apiKey });
         if (second.resp.ok) {
           const c2 = second.data?.choices?.[0];
@@ -244,7 +238,8 @@ module.exports = async function (context, req) {
             usage: data?.usage,
             finish_reason: data?.choices?.[0]?.finish_reason,
             had_oyd: !!oydBlock,
-            api_version: apiVersion
+            api_version: apiVersion,
+            used_max_completion_tokens: tryMCTFirst
           }
         };
         return;
