@@ -125,3 +125,34 @@ module.exports = async function (context, req) {
     context.res = { status: 500, headers: {"Content-Type":"application/json"}, body: { error: "server error", detail: String(e) } };
   }
 };
+
+extra_body: {
+    data_sources: [
+      {
+        type: "azure_search",
+        parameters: {
+          endpoint: process.env.AZURE_SEARCH_ENDPOINT,    // https://<svc>.search.windows.net
+          index_name: process.env.AZURE_SEARCH_INDEX,     // your index name
+          authentication: {
+            type: "api_key",
+            key: process.env.AZURE_SEARCH_KEY             // use the QUERY key for read-only
+          },
+          // Retrieval tuning
+          query_type: "vector_semantic_hybrid",           // strong default
+          semantic_configuration: "default",              // if you created one in AI Search
+          top_n_documents: 6,
+          strictness: 3,
+          // Map your index fields here (adjust to your schema)
+          fields_mapping: {
+            content_fields: ["content", "chunk", "page_content"],
+            title_field: "title",
+            filepath_field: "source",
+            url_field: "url"
+          },
+          // Include citations & intent in the response context (optional)
+          include_contexts: ["citations", "intent"]
+        }
+      }
+    ]
+  }
+});
