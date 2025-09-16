@@ -8,8 +8,9 @@ let FAQ_SNIPPET = "";
 let POLICIES_SNIPPET = "";
 
 function readIfExists(p) { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } }
+
 function initConfig() {
-  if (SYS_PROMPT) return; // already loaded
+  if (SYS_PROMPT) return; // already loaded this cold start
   const cfgDir = path.join(__dirname, "../_config");
   SYS_PROMPT       = readIfExists(path.join(cfgDir, "system_prompt.txt")).trim();
   FAQ_SNIPPET      = readIfExists(path.join(cfgDir, "faqs.txt")).trim();
@@ -90,10 +91,11 @@ async function querySearch(q) {
 }
 
 function looksInfoSeeking(msg) {
-  // Very lightweight heuristic—tune as you like
+  // Very lightweight heuristic—tune as needed
   return /insurance|in[-\s]*network|bcbs|blue\s*cross|polic(y|ies)|copay|benefit|provider|schedule|availability|psychiatr|therap/i.test(msg);
 }
 
+// ---------- main function ----------
 module.exports = async function (context, req) {
   try {
     initConfig();
@@ -104,7 +106,7 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // ---- safe env vars ----
+    // Safe env reads
     const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview") + "").trim();
     const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
     const deployment = ((process.env.AZURE_OPENAI_DEPLOYMENT || "") + "").trim();
@@ -128,14 +130,22 @@ module.exports = async function (context, req) {
       }
     }
 
-    // ---- Build messages ----
-    const baseMessages = [
+    // ---- Bring in recent chat history from the client (optional) ----
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const normalizedHistory = history.slice(-8).map(m => ({
+      role: m?.role === 'assistant' ? 'assistant' : 'user',
+      content: ((m?.content || '') + '').trim()
+    })).filter(m => m.content);
+
+    // ---- Build messages: system -> prior turns -> latest user ----
+    const messages = [
       { role: "system", content: (SYS_PROMPT || "You are a helpful intake assistant.") + contextBlock },
+      ...normalizedHistory,
       { role: "user",   content: userMessage }
     ];
 
     // First attempt (give enough room to answer)
-    let { resp, data } = await callAOAI(url, baseMessages, 1, 384, apiKey);
+    let { resp, data } = await callAOAI(url, messages, 1, 384, apiKey);
     let choice = data?.choices?.[0];
     let reply  = (choice?.message?.content || "").trim();
 
@@ -145,13 +155,14 @@ module.exports = async function (context, req) {
         return cfr && Object.values(cfr).some(v => v?.filtered);
       }));
 
-    // If empty or filtered, retry once with a firmer nudge
+    // If empty or filtered, retry once with a firmer nudge (keep history + context)
     if ((!reply || filtered) && resp.ok) {
       const nudged = [
         { role: "system", content: (SYS_PROMPT || "You are a helpful intake assistant.") + `
 - Always respond in plain text (no tools), 1–2 sentences unless the user asks for detail.
 - If nothing is appropriate to say, reply with a brief clarification question.
 ` + contextBlock },
+        ...normalizedHistory,
         { role: "user", content: userMessage }
       ];
       const second = await callAOAI(url, nudged, 1, 256, apiKey);
@@ -184,7 +195,8 @@ module.exports = async function (context, req) {
           sys_prompt_bytes: (SYS_PROMPT || "").length,
           files_present: { system_prompt: !!SYS_PROMPT, faqs: !!FAQ_SNIPPET, policies: !!POLICIES_SNIPPET },
           search_used: !!contextBlock,
-          search_items: searchItems
+          search_items: searchItems,
+          history_len: normalizedHistory.length
         }
       };
       return;
