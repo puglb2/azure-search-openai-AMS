@@ -58,18 +58,15 @@ async function postJson(url, body, headers = {}, timeoutMs = 30000) {
 
 // ---------- Build embeddings dependency ----------
 function buildEmbeddingDependency(env) {
-  // Preferred: name of an embeddings deployment in the SAME AOAI resource
+  // Preferred: embeddings deployment name in the SAME AOAI resource
   const deploymentName = ((env.AZURE_EMBEDDINGS_DEPLOYMENT || "") + "").trim();
   if (deploymentName) {
-    return {
-      type: "deployment_name",
-      deployment_name: deploymentName
-    };
+    return { type: "deployment_name", deployment_name: deploymentName };
   }
 
   // Alternate: explicit embeddings endpoint + key
-  // Endpoint must look like:
-  //   https://<aoai>.openai.azure.com/openai/deployments/<EMBED_DEPLOYMENT>/embeddings  (NO api-version query)
+  // Endpoint format:
+  //   https://<aoai>.openai.azure.com/openai/deployments/<EMBED_DEPLOYMENT>/embeddings
   const endpoint = ((env.AZURE_EMBEDDINGS_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
   const key      = ((env.AZURE_EMBEDDINGS_API_KEY || env.AZURE_OPENAI_API_KEY || "") + "").trim();
   if (endpoint && key) {
@@ -103,9 +100,9 @@ function buildOydBlock(env, { safeMode }) {
         endpoint,
         index_name: index,
         authentication: { type: "api_key", key },
-        top_n_documents: 9,   // per user request
+        top_n_documents: 9,
         strictness: 3,
-        query_type: "simple"  // avoid vector/semantic until basics are verified
+        query_type: "simple"
       }
     };
   }
@@ -125,7 +122,7 @@ function buildOydBlock(env, { safeMode }) {
     endpoint,
     index_name: index,
     authentication: { type: "api_key", key },
-    top_n_documents: 9,    // per user request
+    top_n_documents: 9,
     strictness: 3,
     query_type: queryType
   };
@@ -134,7 +131,6 @@ function buildOydBlock(env, { safeMode }) {
     parameters.semantic_configuration = semantic;
   }
 
-  // Only include embeddings when actually using vector modes and we have one
   if (embedding_dependency) {
     parameters.embedding_dependency = embedding_dependency;
   }
@@ -188,8 +184,8 @@ module.exports = async function (context, req) {
     // Prepare request body
     const requestBody = {
       messages: baseMessages,
-      temperature: 1,     // per user request
-      max_completion_tokens: 600
+      temperature: 1,     // per your request
+      max_tokens: 600
     };
     // OYD goes at TOP LEVEL as `data_sources`
     if (oydBlock) {
@@ -214,7 +210,7 @@ module.exports = async function (context, req) {
       const choice = data?.choices?.[0];
       let reply = (choice?.message?.content || "").trim();
 
-      // Optionally retry if filtered/empty
+      // Optional retry if filtered/empty
       const filtered = choice?.finish_reason === "content_filter" ||
         (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
           const cfr = r?.content_filter_results;
@@ -229,7 +225,7 @@ module.exports = async function (context, req) {
             baseMessages[1]
           ],
           temperature: 1,
-          max_completion_tokens: 400
+          max_tokens: 400
         };
         if (oydBlock) nudgedBody.data_sources = [oydBlock];
         const second = await postJson(url, nudgedBody, { "api-key": apiKey });
@@ -258,7 +254,7 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Non-2xx: surface the actual upstream status & details (no hint line, per request)
+    // Non-2xx: surface the actual upstream status & details
     context.res = {
       status: resp.status,
       headers: { "Content-Type":"application/json" },
