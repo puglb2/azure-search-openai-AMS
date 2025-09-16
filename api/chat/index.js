@@ -47,65 +47,110 @@ async function postJson(url, body, headers = {}, timeoutMs = 30000) {
       signal: controller.signal
     });
     const ct = resp.headers.get("content-type") || "";
-    const data = ct.includes("application/json") ? await resp.json().catch(() => ({})) : { text: await resp.text().catch(() => "") };
+    const data = ct.includes("application/json")
+      ? await resp.json().catch(() => ({}))
+      : { text: await resp.text().catch(() => "") };
     return { resp, data };
   } finally {
     clearTimeout(id);
   }
 }
 
+// ---------- Build embeddings dependency ----------
+function buildEmbeddingDependency(env) {
+  // Preferred: name of an embeddings deployment in the SAME AOAI resource
+  const deploymentName = ((env.AZURE_EMBEDDINGS_DEPLOYMENT || "") + "").trim();
+  if (deploymentName) {
+    return {
+      type: "deployment_name",
+      deployment_name: deploymentName
+    };
+  }
+
+  // Alternate: explicit embeddings endpoint + key
+  // Endpoint must look like:
+  //   https://<aoai>.openai.azure.com/openai/deployments/<EMBED_DEPLOYMENT>/embeddings  (NO api-version query)
+  const endpoint = ((env.AZURE_EMBEDDINGS_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
+  const key      = ((env.AZURE_EMBEDDINGS_API_KEY || env.AZURE_OPENAI_API_KEY || "") + "").trim();
+  if (endpoint && key) {
+    return {
+      type: "endpoint",
+      endpoint,
+      authentication: { type: "api_key", key }
+    };
+  }
+
+  return undefined; // none configured
+}
+
 // ---------- Build OYD block if Search is configured ----------
-function buildOydBlock(env, safeMode) {
+function buildOydBlock(env, { safeMode }) {
   const endpoint = ((env.AZURE_SEARCH_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
   const key      = ((env.AZURE_SEARCH_KEY || "") + "").trim();
   const index    = ((env.AZURE_SEARCH_INDEX || "") + "").trim();
 
   if (!endpoint || !key || !index) return undefined;
 
+  // Query type & semantic config
+  let queryType = ((env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim();
+  const semantic = ((env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim();
+
+  // Minimal block when safe mode is on
   if (safeMode) {
-    // Minimal/robust OYD block to rule out schema issues
     return {
       type: "azure_search",
       parameters: {
         endpoint,
         index_name: index,
         authentication: { type: "api_key", key },
-        top_n_documents: 9,
+        top_n_documents: 9,   // per user request
         strictness: 3,
-        query_type: "simple"
+        query_type: "simple"  // avoid vector/semantic until basics are verified
       }
     };
   }
 
-  const queryType = ((env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim();
-  const semantic  = ((env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim();
-
-  const block = {
-    type: "azure_search",
-    parameters: {
-      endpoint,
-      index_name: index,
-      authentication: { type: "api_key", key },
-      top_n_documents: 6,
-      strictness: 3,
-      query_type: queryType
+  // If using a vector* query type, we must supply an embeddings dependency
+  const isVectorMode = ["vector", "vector_simple_hybrid", "vector_semantic_hybrid"].includes(queryType);
+  let embedding_dependency = undefined;
+  if (isVectorMode) {
+    embedding_dependency = buildEmbeddingDependency(env);
+    if (!embedding_dependency) {
+      // No embeddings configured → degrade to simple to avoid hard failure
+      queryType = "simple";
     }
+  }
+
+  const parameters = {
+    endpoint,
+    index_name: index,
+    authentication: { type: "api_key", key },
+    top_n_documents: 9,    // per user request
+    strictness: 3,
+    query_type: queryType
   };
 
-  if (semantic) block.parameters.semantic_configuration = semantic;
+  if (semantic && (queryType === "semantic" || queryType === "vector_semantic_hybrid")) {
+    parameters.semantic_configuration = semantic;
+  }
 
-  // Only map fields you actually have in your index.
-  block.parameters.fields_mapping = {
+  // Only include embeddings when actually using vector modes and we have one
+  if (embedding_dependency) {
+    parameters.embedding_dependency = embedding_dependency;
+  }
+
+  // Add field mappings ONLY if these fields exist in your index; adjust if needed.
+  parameters.fields_mapping = {
     content_fields: ["content", "chunk", "page_content"],
     title_field: "title",
     filepath_field: "source",
     url_field: "url"
   };
 
-  // Optional
-  block.parameters.include_contexts = ["citations", "intent"];
+  // Optional contexts
+  parameters.include_contexts = ["citations", "intent"];
 
-  return block;
+  return { type: "azure_search", parameters };
 }
 
 module.exports = async function (context, req) {
@@ -131,7 +176,7 @@ module.exports = async function (context, req) {
 
     const oydEnabled = String(process.env.AZURE_OYD_ENABLED || "1") !== "0";
     const safeMode   = String(process.env.AZURE_SEARCH_SAFE_MODE || "0") === "1";
-    const oydBlock   = oydEnabled ? buildOydBlock(process.env, safeMode) : undefined;
+    const oydBlock   = oydEnabled ? buildOydBlock(process.env, { safeMode }) : undefined;
 
     const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
 
@@ -143,10 +188,10 @@ module.exports = async function (context, req) {
     // Prepare request body
     const requestBody = {
       messages: baseMessages,
-      temperature: 1,
+      temperature: 1,     // per user request
       max_tokens: 600
     };
-    // ✅ OYD now goes at TOP LEVEL as `data_sources` (not inside extra_body)
+    // OYD goes at TOP LEVEL as `data_sources`
     if (oydBlock) {
       requestBody.data_sources = [oydBlock];
     }
@@ -169,6 +214,7 @@ module.exports = async function (context, req) {
       const choice = data?.choices?.[0];
       let reply = (choice?.message?.content || "").trim();
 
+      // Optionally retry if filtered/empty
       const filtered = choice?.finish_reason === "content_filter" ||
         (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
           const cfr = r?.content_filter_results;
@@ -212,7 +258,7 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Non-2xx: surface the actual upstream status & details
+    // Non-2xx: surface the actual upstream status & details (no hint line, per request)
     context.res = {
       status: resp.status,
       headers: { "Content-Type":"application/json" },
@@ -229,7 +275,7 @@ module.exports = async function (context, req) {
           has_SEARCH_KEY: !!process.env.AZURE_SEARCH_KEY,
           oyd_enabled: !!oydBlock,
           safe_mode: safeMode
-        },
+        }
       }
     };
   } catch (e) {
