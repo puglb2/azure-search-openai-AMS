@@ -2,6 +2,12 @@
 const fs = require("fs");
 const path = require("path");
 
+// Ensure fetch exists in this Node runtime (SWA Functions may vary)
+if (typeof fetch === "undefined") {
+  // Prefer undici if available in the runtime
+  try { global.fetch = require("undici").fetch; } catch { /* no-op */ }
+}
+
 // ---------- load & cache instruction files ----------
 let SYS_PROMPT = "";
 let FAQ_SNIPPET = "";
@@ -30,30 +36,78 @@ ${POLICIES_SNIPPET}`.trim();
   }
 }
 
-// ---------- AOAI call helper ----------
-async function callAOAI({ url, messages, temperature, maxTokens, apiKey, oydBlock }) {
-  const body = {
-    messages,
-    temperature,
-    max_tokens: maxTokens,              // ✅ use max_tokens; Azure ignores unknown fields
-  };
+// ---------- HTTP helper with better diagnostics ----------
+async function postJson(url, body, headers = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const ct = resp.headers.get("content-type") || "";
+    const data = ct.includes("application/json") ? await resp.json().catch(() => ({})) : { text: await resp.text().catch(() => "") };
+    return { resp, data };
+  } finally {
+    clearTimeout(id);
+  }
+}
 
-  // Attach On-Your-Data only if provided
-  if (oydBlock) {
-    body.extra_body = {
-      data_sources: [oydBlock],
+// ---------- Build OYD block if Search is configured ----------
+function buildOydBlock(env, safeMode) {
+  const endpoint = ((env.AZURE_SEARCH_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
+  const key      = ((env.AZURE_SEARCH_KEY || "") + "").trim();
+  const index    = ((env.AZURE_SEARCH_INDEX || "") + "").trim();
+
+  if (!endpoint || !key || !index) return undefined;
+
+  if (safeMode) {
+    // Minimal/robust OYD block to rule out schema issues
+    return {
+      type: "azure_search",
+      parameters: {
+        endpoint,
+        index_name: index,
+        authentication: { type: "api_key", key },
+        top_n_documents: 3,
+        strictness: 3,
+        query_type: "simple"
+      }
     };
   }
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "api-key": apiKey },
-    body: JSON.stringify(body),
-  });
+  const queryType = ((env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim();
+  const semantic  = ((env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim();
 
-  const ct = resp.headers.get("content-type") || "";
-  const data = ct.includes("application/json") ? await resp.json() : { text: await resp.text() };
-  return { resp, data };
+  const block = {
+    type: "azure_search",
+    parameters: {
+      endpoint,
+      index_name: index,
+      authentication: { type: "api_key", key },
+      top_n_documents: 6,
+      strictness: 3,
+      query_type: queryType
+    }
+  };
+
+  if (semantic) block.parameters.semantic_configuration = semantic;
+
+  // Only map fields you actually have in your index.
+  // If unsure, start without fields_mapping and add gradually.
+  block.parameters.fields_mapping = {
+    content_fields: ["content", "chunk", "page_content"],
+    title_field: "title",
+    filepath_field: "source",
+    url_field: "url"
+  };
+
+  // Optional
+  block.parameters.include_contexts = ["citations", "intent"];
+
+  return block;
 }
 
 module.exports = async function (context, req) {
@@ -66,23 +120,20 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // ---- SAFE reads of env vars (no undefined.trim()!) ----
+    // ---- Env vars (safe reads) ----
     const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-10-21") + "").trim();
-    const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,"");   // e.g. https://<resource>.openai.azure.com
+    const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,""); // e.g. https://<resource>.openai.azure.com
     const deployment = ((process.env.AZURE_OPENAI_DEPLOYMENT || "") + "").trim();
     const apiKey     = ((process.env.AZURE_OPENAI_API_KEY || "") + "").trim();
-
-    // Azure AI Search (optional; if missing, we skip OYD)
-    const searchEndpoint = ((process.env.AZURE_SEARCH_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
-    const searchKey      = ((process.env.AZURE_SEARCH_KEY || "") + "").trim();
-    const searchIndex    = ((process.env.AZURE_SEARCH_INDEX || "") + "").trim();
-    const searchSemantic = ((process.env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim(); // optional
-    const searchQueryType= ((process.env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim(); // optional
 
     if (!endpoint || !deployment || !apiKey) {
       context.res = { status: 200, headers: { "Content-Type":"application/json" }, body: { reply: "Hello! (Model not configured yet.)" } };
       return;
     }
+
+    const oydEnabled = String(process.env.AZURE_OYD_ENABLED || "1") !== "0";
+    const safeMode   = String(process.env.AZURE_SEARCH_SAFE_MODE || "0") === "1";
+    const oydBlock   = oydEnabled ? buildOydBlock(process.env, safeMode) : undefined;
 
     const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
 
@@ -91,120 +142,104 @@ module.exports = async function (context, req) {
       { role: "user",   content: userMessage }
     ];
 
-    // Build the OYD block if search is configured; otherwise undefined
-    let oydBlock = undefined;
-    if (searchEndpoint && searchKey && searchIndex) {
-      oydBlock = {
-        type: "azure_search",
-        parameters: {
-          endpoint: searchEndpoint,           // https://<svc>.search.windows.net
-          index_name: searchIndex,            // your index name
-          authentication: { type: "api_key", key: searchKey }, // use QUERY key for read-only
-          // Retrieval tuning (sane defaults)
-          top_n_documents: 6,
-          strictness: 3,
-          query_type: searchQueryType,        // e.g., vector_semantic_hybrid
-          // Only include semantic_configuration if you actually created one
-          ...(searchSemantic ? { semantic_configuration: searchSemantic } : {}),
-
-          // Map to your actual fields! Adjust these if your index schema differs.
-          fields_mapping: {
-            content_fields: ["content", "chunk", "page_content"],
-            title_field: "title",
-            filepath_field: "source",
-            url_field: "url"
-          },
-
-          // Optional: include contexts Azure can return (varies by API version)
-          include_contexts: ["citations", "intent"]
-        }
-      };
-    }
-
-    // -------- First attempt (with/without OYD) --------
-    let { resp, data } = await callAOAI({
-      url,
+    // Prepare request body
+    const requestBody = {
       messages: baseMessages,
       temperature: 0.2,
-      maxTokens: 600,
-      apiKey,
-      oydBlock
-    });
-
-    // Extract reply
-    let choice = data?.choices?.[0];
-    let reply  = choice?.message?.content?.trim() || "";
-    const filtered = choice?.finish_reason === "content_filter" ||
-      (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
-        const cfr = r?.content_filter_results;
-        return cfr && Object.values(cfr).some(v => v?.filtered);
-      }));
-
-    // -------- Retry once with a tiny nudge if empty/filtered and the HTTP was OK --------
-    if ((!reply || filtered) && resp.ok) {
-      const nudged = [
-        baseMessages[0],
-        { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
-        baseMessages[1]
-      ];
-      const second = await callAOAI({
-        url,
-        messages: nudged,
-        temperature: 0.2,
-        maxTokens: 400,
-        apiKey,
-        oydBlock
-      });
-      resp   = second.resp;
-      data   = second.data;
-      choice = data?.choices?.[0];
-      reply  = (choice?.message?.content?.trim() || reply || "");
+      max_tokens: 600
+    };
+    if (oydBlock) {
+      requestBody.extra_body = { data_sources: [oydBlock] };
     }
 
-    // If API returned non-2xx, show details so you can fix config quickly
-    if (!resp.ok) {
-      context.res = {
-        status: 502,
-        headers: {"Content-Type":"application/json"},
-        body: {
-          error: "LLM error",
-          status: resp.status,
-          detail: data,
-          env_check: {
-            has_OPENAI_ENDPOINT: !!endpoint,
-            has_OPENAI_DEPLOYMENT: !!deployment,
-            has_OPENAI_API_VERSION: !!apiVersion,
-            has_SEARCH_ENDPOINT: !!searchEndpoint,
-            has_SEARCH_INDEX: !!searchIndex,
-            has_SEARCH_KEY: !!searchKey
+    // --- Call AOAI (with simple retry for transient 429/503) ---
+    let attempt = 0, result, resp, data;
+    while (attempt < 2) {
+      attempt++;
+      result = await postJson(url, requestBody, { "api-key": apiKey });
+      resp = result.resp; data = result.data;
+
+      if (resp.status === 429 || resp.status === 503) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+      break;
+    }
+
+    // Extract reply if success
+    if (resp.ok) {
+      const choice = data?.choices?.[0];
+      let reply = (choice?.message?.content || "").trim();
+
+      // Optional second try if content filtered / empty
+      const filtered = choice?.finish_reason === "content_filter" ||
+        (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
+          const cfr = r?.content_filter_results;
+          return cfr && Object.values(cfr).some(v => v?.filtered);
+        }));
+
+      if ((!reply || filtered) && !req.query?.debug) {
+        const nudgedBody = {
+          messages: [
+            baseMessages[0],
+            { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
+            baseMessages[1]
+          ],
+          temperature: 0.2,
+          max_tokens: 400
+        };
+        if (oydBlock) nudgedBody.extra_body = { data_sources: [oydBlock] };
+        const second = await postJson(url, nudgedBody, { "api-key": apiKey });
+        if (second.resp.ok) {
+          const c2 = second.data?.choices?.[0];
+          reply = (c2?.message?.content || reply || "").trim();
+        }
+      }
+
+      if (req.query?.debug === "1") {
+        context.res = {
+          status: 200,
+          headers: { "Content-Type":"application/json" },
+          body: {
+            reply: reply || "",
+            usage: data?.usage,
+            finish_reason: data?.choices?.[0]?.finish_reason,
+            had_oyd: !!oydBlock,
+            api_version: apiVersion
           }
-        }
-      };
+        };
+        return;
+      }
+
+      context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply: reply || "" } };
       return;
     }
 
-    // Optional debug: /api/chat?debug=1
-    if ((req.query?.debug === "1") && data) {
-      context.res = {
-        status: 200,
-        headers: { "Content-Type":"application/json" },
-        body: {
-          reply: reply || "",
-          finish_reason: choice?.finish_reason,
-          prompt_filter_results: data?.prompt_filter_results,
-          usage: data?.usage,
-          had_oyd: !!oydBlock
-        }
-      };
-      return;
-    }
-
-    context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply: reply || "" } };
+    // If non-2xx: return upstream status & details so you can fix quickly
+    context.res = {
+      status: resp.status, // <-- surface the actual upstream status, not 502
+      headers: { "Content-Type":"application/json" },
+      body: {
+        error: "Upstream Azure OpenAI error",
+        upstream_status: resp.status,
+        detail: data,
+        env_check: {
+          has_OPENAI_ENDPOINT: !!endpoint,
+          has_OPENAI_DEPLOYMENT: !!deployment,
+          has_OPENAI_API_VERSION: !!apiVersion,
+          has_SEARCH_ENDPOINT: !!process.env.AZURE_SEARCH_ENDPOINT,
+          has_SEARCH_INDEX: !!process.env.AZURE_SEARCH_INDEX,
+          has_SEARCH_KEY: !!process.env.AZURE_SEARCH_KEY,
+          oyd_enabled: !!oydBlock,
+          safe_mode: safeMode
+        },
+        hint: "If detail says unrecognized argument 'extra_body', try AZURE_OPENAI_API_VERSION=2024-05-01-preview; or set AZURE_OYD_ENABLED=0 to isolate."
+      }
+    };
   } catch (e) {
-    // Return the error text so you can see what failed (temporarily; remove later if you prefer)
     context.res = {
       status: 500,
-      headers: {"Content-Type":"application/json"},
+      headers: { "Content-Type":"application/json" },
       body: {
         error: "server error",
         detail: String(e),
