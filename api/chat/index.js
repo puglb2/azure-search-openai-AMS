@@ -189,7 +189,7 @@ module.exports = async function (context, req) {
     const requestBody = {
       messages: baseMessages,
       temperature: 1,     // per user request
-      max_tokens: 600
+      max_completion_tokens: 600
     };
     // OYD goes at TOP LEVEL as `data_sources`
     if (oydBlock) {
@@ -229,7 +229,7 @@ module.exports = async function (context, req) {
             baseMessages[1]
           ],
           temperature: 1,
-          max_tokens: 400
+          max_completion_tokens: 400
         };
         if (oydBlock) nudgedBody.data_sources = [oydBlock];
         const second = await postJson(url, nudgedBody, { "api-key": apiKey });
