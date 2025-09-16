@@ -12,9 +12,9 @@ function readIfExists(p) { try { return fs.readFileSync(p, "utf8"); } catch { re
 function initConfig() {
   if (SYS_PROMPT) return; // already loaded
   const cfgDir = path.join(__dirname, "../_config");
-  SYS_PROMPT      = readIfExists(path.join(cfgDir, "system_prompt.txt")).trim();
-  FAQ_SNIPPET     = readIfExists(path.join(cfgDir, "faqs.txt")).trim();
-  POLICIES_SNIPPET= readIfExists(path.join(cfgDir, "policies.txt")).trim();
+  SYS_PROMPT       = readIfExists(path.join(cfgDir, "system_prompt.txt")).trim();
+  FAQ_SNIPPET      = readIfExists(path.join(cfgDir, "faqs.txt")).trim();
+  POLICIES_SNIPPET = readIfExists(path.join(cfgDir, "policies.txt")).trim();
 
   if (FAQ_SNIPPET) {
     SYS_PROMPT += `
@@ -31,16 +31,26 @@ ${POLICIES_SNIPPET}`.trim();
 }
 
 // ---------- AOAI call helper ----------
-async function callAOAI(url, messages, temperature, maxTokens, apiKey) {
+async function callAOAI({ url, messages, temperature, maxTokens, apiKey, oydBlock }) {
+  const body = {
+    messages,
+    temperature,
+    max_tokens: maxTokens,              // ✅ use max_tokens; Azure ignores unknown fields
+  };
+
+  // Attach On-Your-Data only if provided
+  if (oydBlock) {
+    body.extra_body = {
+      data_sources: [oydBlock],
+    };
+  }
+
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "api-key": apiKey },
-    body: JSON.stringify({
-      messages,
-      temperature,                 // your model needs 1
-      max_completion_tokens: maxTokens
-    })
+    body: JSON.stringify(body),
   });
+
   const ct = resp.headers.get("content-type") || "";
   const data = ct.includes("application/json") ? await resp.json() : { text: await resp.text() };
   return { resp, data };
@@ -57,10 +67,17 @@ module.exports = async function (context, req) {
     }
 
     // ---- SAFE reads of env vars (no undefined.trim()!) ----
-    const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview") + "").trim();
+    const apiVersion = ((process.env.AZURE_OPENAI_API_VERSION || "2024-10-21") + "").trim();
     const endpoint   = ((process.env.AZURE_OPENAI_ENDPOINT || "") + "").trim().replace(/\/+$/,"");   // e.g. https://<resource>.openai.azure.com
     const deployment = ((process.env.AZURE_OPENAI_DEPLOYMENT || "") + "").trim();
     const apiKey     = ((process.env.AZURE_OPENAI_API_KEY || "") + "").trim();
+
+    // Azure AI Search (optional; if missing, we skip OYD)
+    const searchEndpoint = ((process.env.AZURE_SEARCH_ENDPOINT || "") + "").trim().replace(/\/+$/,"");
+    const searchKey      = ((process.env.AZURE_SEARCH_KEY || "") + "").trim();
+    const searchIndex    = ((process.env.AZURE_SEARCH_INDEX || "") + "").trim();
+    const searchSemantic = ((process.env.AZURE_SEARCH_SEMANTIC_CONFIG || "") + "").trim(); // optional
+    const searchQueryType= ((process.env.AZURE_SEARCH_QUERY_TYPE || "vector_semantic_hybrid") + "").trim(); // optional
 
     if (!endpoint || !deployment || !apiKey) {
       context.res = { status: 200, headers: { "Content-Type":"application/json" }, body: { reply: "Hello! (Model not configured yet.)" } };
@@ -74,33 +91,95 @@ module.exports = async function (context, req) {
       { role: "user",   content: userMessage }
     ];
 
-    // First attempt
-    let { resp, data } = await callAOAI(url, baseMessages, 1, 384, apiKey);
+    // Build the OYD block if search is configured; otherwise undefined
+    let oydBlock = undefined;
+    if (searchEndpoint && searchKey && searchIndex) {
+      oydBlock = {
+        type: "azure_search",
+        parameters: {
+          endpoint: searchEndpoint,           // https://<svc>.search.windows.net
+          index_name: searchIndex,            // your index name
+          authentication: { type: "api_key", key: searchKey }, // use QUERY key for read-only
+          // Retrieval tuning (sane defaults)
+          top_n_documents: 6,
+          strictness: 3,
+          query_type: searchQueryType,        // e.g., vector_semantic_hybrid
+          // Only include semantic_configuration if you actually created one
+          ...(searchSemantic ? { semantic_configuration: searchSemantic } : {}),
+
+          // Map to your actual fields! Adjust these if your index schema differs.
+          fields_mapping: {
+            content_fields: ["content", "chunk", "page_content"],
+            title_field: "title",
+            filepath_field: "source",
+            url_field: "url"
+          },
+
+          // Optional: include contexts Azure can return (varies by API version)
+          include_contexts: ["citations", "intent"]
+        }
+      };
+    }
+
+    // -------- First attempt (with/without OYD) --------
+    let { resp, data } = await callAOAI({
+      url,
+      messages: baseMessages,
+      temperature: 0.2,
+      maxTokens: 600,
+      apiKey,
+      oydBlock
+    });
+
+    // Extract reply
     let choice = data?.choices?.[0];
     let reply  = choice?.message?.content?.trim() || "";
-
     const filtered = choice?.finish_reason === "content_filter" ||
       (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
         const cfr = r?.content_filter_results;
         return cfr && Object.values(cfr).some(v => v?.filtered);
       }));
 
-    // Retry once with a tiny nudge if empty/filtered
+    // -------- Retry once with a tiny nudge if empty/filtered and the HTTP was OK --------
     if ((!reply || filtered) && resp.ok) {
       const nudged = [
         baseMessages[0],
         { role: "user", content: "Instruction: Respond in plain text (1–2 sentences). Do not call tools." },
         baseMessages[1]
       ];
-      const second = await callAOAI(url, nudged, 1, 256, apiKey);
+      const second = await callAOAI({
+        url,
+        messages: nudged,
+        temperature: 0.2,
+        maxTokens: 400,
+        apiKey,
+        oydBlock
+      });
       resp   = second.resp;
       data   = second.data;
       choice = data?.choices?.[0];
-      reply  = choice?.message?.content?.trim() || reply;
+      reply  = (choice?.message?.content?.trim() || reply || "");
     }
 
+    // If API returned non-2xx, show details so you can fix config quickly
     if (!resp.ok) {
-      context.res = { status: 502, headers: {"Content-Type":"application/json"}, body: { error: "LLM error", status: resp.status, detail: data } };
+      context.res = {
+        status: 502,
+        headers: {"Content-Type":"application/json"},
+        body: {
+          error: "LLM error",
+          status: resp.status,
+          detail: data,
+          env_check: {
+            has_OPENAI_ENDPOINT: !!endpoint,
+            has_OPENAI_DEPLOYMENT: !!deployment,
+            has_OPENAI_API_VERSION: !!apiVersion,
+            has_SEARCH_ENDPOINT: !!searchEndpoint,
+            has_SEARCH_INDEX: !!searchIndex,
+            has_SEARCH_KEY: !!searchKey
+          }
+        }
+      };
       return;
     }
 
@@ -113,7 +192,8 @@ module.exports = async function (context, req) {
           reply: reply || "",
           finish_reason: choice?.finish_reason,
           prompt_filter_results: data?.prompt_filter_results,
-          usage: data?.usage
+          usage: data?.usage,
+          had_oyd: !!oydBlock
         }
       };
       return;
@@ -122,37 +202,14 @@ module.exports = async function (context, req) {
     context.res = { status: 200, headers: {"Content-Type":"application/json"}, body: { reply: reply || "" } };
   } catch (e) {
     // Return the error text so you can see what failed (temporarily; remove later if you prefer)
-    context.res = { status: 500, headers: {"Content-Type":"application/json"}, body: { error: "server error", detail: String(e) } };
+    context.res = {
+      status: 500,
+      headers: {"Content-Type":"application/json"},
+      body: {
+        error: "server error",
+        detail: String(e),
+        note: "Check SWA → Functions → Log stream for stack trace."
+      }
+    };
   }
 };
-
-extra_body: {
-    data_sources: [
-      {
-        type: "azure_search",
-        parameters: {
-          endpoint: process.env.AZURE_SEARCH_ENDPOINT,    // https://<svc>.search.windows.net
-          index_name: process.env.AZURE_SEARCH_INDEX,     // your index name
-          authentication: {
-            type: "api_key",
-            key: process.env.AZURE_SEARCH_KEY             // use the QUERY key for read-only
-          },
-          // Retrieval tuning
-          query_type: "vector_semantic_hybrid",           // strong default
-          semantic_configuration: "default",              // if you created one in AI Search
-          top_n_documents: 6,
-          strictness: 3,
-          // Map your index fields here (adjust to your schema)
-          fields_mapping: {
-            content_fields: ["content", "chunk", "page_content"],
-            title_field: "title",
-            filepath_field: "source",
-            url_field: "url"
-          },
-          // Include citations & intent in the response context (optional)
-          include_contexts: ["citations", "intent"]
-        }
-      }
-    ]
-  }
-});
