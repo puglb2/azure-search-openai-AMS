@@ -90,12 +90,13 @@ async function querySearch(q) {
   return items.slice(0, 3);
 }
 
-function looksInfoSeeking(msg) {
+if (ALWAYS_SEARCH || looksInfoSeeking(userMessage)) {
   // Very lightweight heuristic—tune as needed
   return /insurance|in[-\s]*network|bcbs|blue\s*cross|polic(y|ies)|copay|benefit|provider|schedule|availability|psychiatr|therap/i.test(msg);
 }
 
 // ---------- main function ----------
+const ALWAYS_SEARCH = ((process.env.AMS_ALWAYS_SEARCH || "") + "").trim().toLowerCase() === "true";
 module.exports = async function (context, req) {
   try {
     initConfig();
