@@ -5,11 +5,8 @@
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "methods": [
-        "post",
-        "options"
-      ],
-      "route": "schedule/appointment"
+      "methods": ["get"],
+      "route": "schedule"
     },
     {
       "type": "http",
