@@ -4,7 +4,6 @@ const path = require("path");
 
 // Ensure fetch exists in this Node runtime (SWA Functions may vary)
 if (typeof fetch === "undefined") {
-  // Prefer undici if available in the runtime
   try { global.fetch = require("undici").fetch; } catch { /* no-op */ }
 }
 
@@ -71,7 +70,7 @@ function buildOydBlock(env, safeMode) {
         endpoint,
         index_name: index,
         authentication: { type: "api_key", key },
-        top_n_documents: 3,
+        top_n_documents: 9,
         strictness: 3,
         query_type: "simple"
       }
@@ -87,7 +86,7 @@ function buildOydBlock(env, safeMode) {
       endpoint,
       index_name: index,
       authentication: { type: "api_key", key },
-      top_n_documents: 9,
+      top_n_documents: 6,
       strictness: 3,
       query_type: queryType
     }
@@ -96,7 +95,6 @@ function buildOydBlock(env, safeMode) {
   if (semantic) block.parameters.semantic_configuration = semantic;
 
   // Only map fields you actually have in your index.
-  // If unsure, start without fields_mapping and add gradually.
   block.parameters.fields_mapping = {
     content_fields: ["content", "chunk", "page_content"],
     title_field: "title",
@@ -148,8 +146,9 @@ module.exports = async function (context, req) {
       temperature: 1,
       max_tokens: 600
     };
+    // ✅ OYD now goes at TOP LEVEL as `data_sources` (not inside extra_body)
     if (oydBlock) {
-      requestBody.extra_body = { data_sources: [oydBlock] };
+      requestBody.data_sources = [oydBlock];
     }
 
     // --- Call AOAI (with simple retry for transient 429/503) ---
@@ -166,12 +165,10 @@ module.exports = async function (context, req) {
       break;
     }
 
-    // Extract reply if success
     if (resp.ok) {
       const choice = data?.choices?.[0];
       let reply = (choice?.message?.content || "").trim();
 
-      // Optional second try if content filtered / empty
       const filtered = choice?.finish_reason === "content_filter" ||
         (Array.isArray(data?.prompt_filter_results) && data.prompt_filter_results.some(r => {
           const cfr = r?.content_filter_results;
@@ -188,7 +185,7 @@ module.exports = async function (context, req) {
           temperature: 1,
           max_tokens: 400
         };
-        if (oydBlock) nudgedBody.extra_body = { data_sources: [oydBlock] };
+        if (oydBlock) nudgedBody.data_sources = [oydBlock];
         const second = await postJson(url, nudgedBody, { "api-key": apiKey });
         if (second.resp.ok) {
           const c2 = second.data?.choices?.[0];
@@ -215,9 +212,9 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // If non-2xx: return upstream status & details so you can fix quickly
+    // Non-2xx: surface the actual upstream status & details
     context.res = {
-      status: resp.status, // <-- surface the actual upstream status, not 502
+      status: resp.status,
       headers: { "Content-Type":"application/json" },
       body: {
         error: "Upstream Azure OpenAI error",
@@ -233,7 +230,6 @@ module.exports = async function (context, req) {
           oyd_enabled: !!oydBlock,
           safe_mode: safeMode
         },
-        hint: "If detail says unrecognized argument 'extra_body', try AZURE_OPENAI_API_VERSION=2024-05-01-preview; or set AZURE_OYD_ENABLED=0 to isolate."
       }
     };
   } catch (e) {
